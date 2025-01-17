@@ -19,6 +19,11 @@ if ! [ -d /sys/class/tpm/tpm0/pcr-sha256 ] && ! [ -d /sys/class/tpm/tpm0/pcr-sha
 	exit 1
 fi
 
+if ! grep rd.shell=0 /etc/kernel/cmdline; then
+	new_cmdline="rd.shell=0 $(cat /etc/kernel/cmdline)"
+	echo "$new_cmdline" >/etc/kernel/cmdline
+fi
+
 dnf --setopt protected_packages= remove -y efi-filesystem dracut-config-rescue grub2-pc
 rm -rvf /boot || true
 
