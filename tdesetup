@@ -1,0 +1,70 @@
+#!/usr/bin/bash
+set -exuo pipefail
+
+dnf copr enable -y chenxiaolong/sbctl
+dnf install -y sbctl ukify systemd-boot jq
+
+if [ "$(sbctl status --json | jq .setup_mode)" != "true" ]; then
+	echo "ERROR: Put device into Setup Mode before running"
+	exit 1
+fi
+
+if ! [ -c /dev/tpmrm0 ]; then
+	echo "ERROR: TPM2 required"
+	exit 1
+fi
+
+if ! [ -d /sys/class/tpm/tpm0/pcr-sha256 ] && ! [ -d /sys/class/tpm/tpm0/pcr-sha384 ] && ! [ -d /sys/class/tpm/tpm0/pcr-sha512 ]; then
+	echo "ERROR: TPM2 PCR hash algorithm unsupported"
+	exit 1
+fi
+
+dnf --setopt protected_packages= remove -y efi-filesystem dracut-config-rescue grub2-pc
+rm -rvf /boot || true
+
+bootctl install
+mkdir -p /boot/efi/EFI/systemd/drivers/
+wget -O /boot/efi/EFI/systemd/drivers/ext2_x64.efi https://github.com/pbatard/efifs/releases/download/v1.11/ext2_x64.efi
+
+cat >/etc/kernel/uki.conf <<EOF
+[UKI]
+PCRBanks=sha256,sha384,sha512
+
+[PCRSignature:initrd]
+Phases=enter-initrd
+PCRPrivateKey=/etc/systemd/tpm2-pcr-private-key-initrd.pem
+PCRPublicKey=/etc/systemd/tpm2-pcr-public-key-initrd.pem
+EOF
+cat >/etc/kernel/install.conf <<EOF
+layout=uki
+uki_generator=ukify
+initrd_generator=dracut
+EOF
+cat >/etc/dracut.conf.d/pcrphase.conf <<EOF
+install_items+=" /usr/lib/systemd/systemd-pcrextend "
+install_items+=" /usr/lib/systemd/system/systemd-pcrphase-initrd.service "
+install_items+=" /usr/lib/systemd/system/initrd.target.wants/systemd-pcrphase-initrd.service "
+EOF
+
+new_crypttab=
+mapfile -t crypttab_entries </etc/crypttab
+for crypttab_entry in "${crypttab_entries[@]}"; do
+	read volume_name encrypted_device key_file options <<<"$crypttab_entry"
+	if ! grep tpm2-device=auto <<<"$options"; then
+		options="${options:+"$options,"}tpm2-device=auto"
+	fi
+	new_crypttab+="$volume_name $encrypted_device $key_file $options"$'\n'
+done
+
+echo -n "$new_crypttab" >/etc/crypttab
+
+sbctl create-keys
+[ -f /etc/systemd/tpm2-pcr-public-key-initrd.pem ] || ukify genkey --config=/etc/kernel/uki.conf
+
+sbctl sign -s /boot/efi/EFI/BOOT/BOOTX64.EFI
+sbctl sign -s /boot/efi/EFI/systemd/systemd-bootx64.efi
+sbctl sign -s /boot/efi/EFI/systemd/drivers/ext2_x64.efi
+
+kernel-install add-all -v
+
+sbctl enroll-keys --tpm-eventlog
